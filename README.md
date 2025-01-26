@@ -14,7 +14,7 @@ SpeechGPT 2.0-preview是端到端语音对话大模型。基于我们在端到�
 
 ### 语义-声学联合建模的超低比特率流式语音Codec
 <p align="center">
-    <img src="asset/codec_arch.jpg" width="50%"> <br>
+    <img src="asset/codec_arch.jpg" width="80%"> <br>
 </p>
 
 - 24khz语音输入
@@ -26,7 +26,7 @@ SpeechGPT 2.0-preview是端到端语音对话大模型。基于我们在端到�
 
 ### 基于Codec Patchify的语音-文本混合建模模型架构
 <p align="center">
-    <img src="asset/sg2_arch.jpg" width="50%"> <br>
+    <img src="asset/sg2_arch.jpg" width="80%"> <br>
 </p>
 
 - Codec Patchify
@@ -73,7 +73,7 @@ python3 demo_gradio.py --codec_ckpt_path SpeechGPT-2.0-preview-Codec/sg2_codec_c
 ```
 
 <p align="center">
-    <img src="asset/gradio.jpeg" width="50%"> <br>
+    <img src="asset/gradio.jpeg" width="70%"> <br>
 </p>
 
 ## 模型能力
