@@ -97,13 +97,12 @@ python3 demo_gradio.py --codec_ckpt_path SpeechGPT-2.0-preview-Codec/sg2_codec_c
 </p>
 
 ## Model Ability
-### Real-time Spoken Conversational Ability
+Welcome to talk to our [Demo system](https://sp2.open-moss.com/) online, and also welcome to check out the system's [demonstration video](https://open-moss.com/en/speechgpt2-preview/).
 
-### Rich in emotion, diverse in style
-
-### Role-playing
-
-### Vocal Talent
+- Real-time Spoken Conversational Ability
+- Rich in emotion, diverse in style
+- Role-playing
+- Vocal Talent
 
 
 ## License
