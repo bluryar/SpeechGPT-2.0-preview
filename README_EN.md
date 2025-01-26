@@ -1,7 +1,7 @@
 # SpeechGPT 2.0-preview
 
 <div align="center" style="line-height: 1;">
-    <a href="https://open-moss.com/cn/speechgpt2-preview/" target="_blank" style="margin: 2px;">
+    <a href="https://open-moss.com/en/speechgpt2-preview/" target="_blank" style="margin: 2px;">
         <img alt="Project Page" src="https://img.shields.io/badge/🏠%20Project%20Page-SpeechGPT-536af5?color=e31a2f&logoColor=white" style="display: inline-block; vertical-align: middle;"/>
     </a>
     <a href="https://sp2.open-moss.com/" target="_blank" style="margin: 2px;">
