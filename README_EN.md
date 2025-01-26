@@ -94,21 +94,21 @@ python3 demo_gradio.py --codec_ckpt_path SpeechGPT-2.0-preview-Codec/sg2_codec_c
     <img src="asset/gradio.jpeg" width="70%"> <br>
 </p>
 
-## 模型能力
-### 口语化，低延时灵活打断
+## Model Ability
+### Real-time Spoken Conversational Ability
 
-### 情感丰富，风格多样
+### Rich in emotion, diverse in style
 
-### 角色扮演
+### Role-playing
 
-### 多才多艺
+### Vocal Talent
 
 
 ## License
-- 本开源仓库的代码遵循 [Apache 2.0](LICENSE) 协议。
+- This code repository is licensed under the [Apache 2.0](LICENSE).
 
 
-## 致谢
+## Acknowledgements
 - [Qwen](https://github.com/QwenLM/Qwen2.5): We use Qwen2.5-7B-Instruct as our base model.
 - [SpeechTokenizer](https://github.com/ZhangXInFD/SpeechTokenizer/tree/main/speechtokenizer)
 
