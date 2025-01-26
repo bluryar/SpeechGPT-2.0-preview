@@ -508,7 +508,7 @@ class MIMOInterface:
             with gr.Row():
                 with gr.Column():
                     greeting_source = gr.Textbox(
-                        label="Greeting File", value="greetings.jsonl"
+                        label="Greeting File", value="extra/greetings.jsonl"
                     )
                     greeting_line_idx = gr.Textbox(label="Greeting ID", value="0")
                     load_greeting_btn = gr.Button("Load Greeting")
