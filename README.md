@@ -1,5 +1,22 @@
 # SpeechGPT 2.0-preview
 
+<div align="center" style="line-height: 1;">
+    <a href="https://open-moss.com/cn/speechgpt2-preview/" target="_blank" style="margin: 2px;">
+        <img alt="Project Page" src="https://img.shields.io/badge/🏠%20Project%20Page-SpeechGPT-536af5?color=e31a2f&logoColor=white" style="display: inline-block; vertical-align: middle;"/>
+    </a>
+    <a href="https://sp2.open-moss.com/" target="_blank" style="margin: 2px;">
+        <img alt="Chat" src="https://img.shields.io/badge/🤖%20Demo-SpeechGPT-536af5?color=1ae3f5&logoColor=white" style="display: inline-block; vertical-align: middle;"/>
+    </a>
+    <a href="https://discord.com/channels/1333092992348721274/1333092994135621807" target="_blank" style="margin: 2px;">
+        <img alt="Discord" src="https://img.shields.io/badge/Discord-SpeechGPT-7289da?logo=discord&logoColor=white&color=7289da" style="display: inline-block; vertical-align: middle;"/>
+    </a>
+    <a href="https://huggingface.co/fnlp" target="_blank" style="margin: 2px;">
+        <img alt="Hugging Face" src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-SpeechGPT-ffc107?color=ffc107&logoColor=white" style="display: inline-block; vertical-align: middle;"/>
+    </a>
+    <a href="https://x.com/Open_MOSS" target="_blank" style="margin: 2px;">
+    <img alt="X Follow" src="https://img.shields.io/badge/Twitter-OpenMOSS-black?logo=x&logoColor=white" style="display: inline-block; vertical-align: middle;"/>
+    </a>
+</div>
 <p align="center">
     <img src="asset/logo.png" width="20%"> <br>
 </p>
@@ -45,7 +62,7 @@ SpeechGPT 2.0-preview是端到端语音对话大模型。基于我们在端到�
 
 
 ## 快速开始
-### 下载仓库
+### 克隆仓库
 ```sh
 git clone https://github.com/OpenMOSS/SpeechGPT-2.0-preview.git
 cd SpeechGPT-2.0-preview
