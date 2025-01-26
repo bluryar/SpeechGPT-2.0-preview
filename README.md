@@ -14,7 +14,7 @@ SpeechGPT 2.0-preview是端到端语音对话大模型。基于我们在端到�
 
 ### 语义-声学联合建模的超低比特率流式语音Codec
 <p align="center">
-    <img src="asset/codec_arch.jpg" width="80%"> <br>
+    <img src="asset/codec_arch.jpg" width="100%"> <br>
 </p>
 
 - 24khz语音输入
@@ -26,7 +26,7 @@ SpeechGPT 2.0-preview是端到端语音对话大模型。基于我们在端到�
 
 ### 基于Codec Patchify的语音-文本混合建模模型架构
 <p align="center">
-    <img src="asset/sg2_arch.jpg" width="80%"> <br>
+    <img src="asset/sg2_arch.jpg" width="100%"> <br>
 </p>
 
 - Codec Patchify
@@ -54,7 +54,7 @@ cd SpeechGPT-2.0-preview
 ### 下载模型权重
 
 ```shell
-# 确保已安装 git-lfs
+# 需要安装 git-lfs
 git lfs install
 git clone https://huggingface.co/fnlp/SpeechGPT-2.0-preview-Codec
 git clone https://huggingface.co/fnlp/SpeechGPT-2.0-preview-7B
