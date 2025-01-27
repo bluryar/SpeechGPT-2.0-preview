@@ -112,7 +112,7 @@ python3 demo_gradio.py --codec_ckpt_path SpeechGPT-2.0-preview-Codec/sg2_codec_c
 ## 致谢
 - [Qwen](https://github.com/QwenLM/Qwen2.5): 我们以Qwen2.5-7B-Instruct作为基座模型。
 - [SpeechTokenizer](https://github.com/ZhangXInFD/SpeechTokenizer/tree/main/speechtokenizer)
-
+- 本项目实时音频传输服务由声网和RTE 开发者社区支持。「RTE 开发者陪跑计划」助力更多优秀 Real-Time AI 和 Voice Agent 项目成长，申请计划：https://www.rtecommunity.dev/t/t_dSuzw47cPBCv8C
 
 ## 引用
 ```
