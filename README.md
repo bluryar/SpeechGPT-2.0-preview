@@ -7,8 +7,8 @@
     <a href="https://sp2.open-moss.com/" target="_blank" style="margin: 2px;">
         <img alt="Chat" src="https://img.shields.io/badge/🤖%20Demo-SpeechGPT-536af5?color=1ae3f5&logoColor=white" style="display: inline-block; vertical-align: middle;"/>
     </a>
-    <a href="https://discord.com/channels/1333092992348721274/1333092994135621807" target="_blank" style="margin: 2px;">
-        <img alt="Discord" src="https://img.shields.io/badge/Discord-SpeechGPT-7289da?logo=discord&logoColor=white&color=7289da" style="display: inline-block; vertical-align: middle;"/>
+    <a href="https://discord.gg/wmJGnd4q" target="_blank" style="margin: 2px;">
+        <img alt="Discord" src="https://img.shields.io/badge/Discord-OpenMOSS-7289da?logo=discord&logoColor=white&color=7289da" style="display: inline-block; vertical-align: middle;"/>
     </a>
     <a href="https://huggingface.co/fnlp" target="_blank" style="margin: 2px;">
         <img alt="Hugging Face" src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-SpeechGPT-ffc107?color=ffc107&logoColor=white" style="display: inline-block; vertical-align: middle;"/>
