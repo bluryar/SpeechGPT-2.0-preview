@@ -14,7 +14,11 @@ import soundfile as sf
 import numpy as np
 import torchaudio
 
-from typing import Any, List, Union
+# 移除环境变量设置，允许使用多GPU
+# os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
+from typing import Any, List, Union, Tuple
 from transformers import HfArgumentParser
 from transformers import (
     AutoTokenizer,
@@ -23,11 +27,11 @@ from transformers import (
     StoppingCriteriaList,
     HfArgumentParser,
 )
+import torch.nn.functional as F
+import torch.distributed as dist
 
 from mimo_qwen2_grouped import *
 from Codec.models.codec import Generator as SpeechGPT2Tokenizer
-
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 
 class MIMOStopper(StoppingCriteria):
@@ -76,14 +80,17 @@ class InputSegment:
 
     @staticmethod
     def insert_between(tensor, i, value=-1):
+        device = tensor.device
+        dtype = tensor.dtype
         return torch.scatter(
             torch.full(
                 (1, tensor.shape[1] + (tensor.shape[1] - 1) * i + i),
                 value,
-                dtype=tensor.dtype,
+                dtype=dtype,
+                device=device
             ),
             1,
-            torch.arange(0, tensor.shape[1], dtype=torch.int64)[None] * (i + 1),
+            torch.arange(0, tensor.shape[1], dtype=torch.int64, device=device)[None] * (i + 1),
             tensor,
         )
 
@@ -91,7 +98,12 @@ class InputSegment:
         self,
         tokenizer,
         group_size: int,
+        device: torch.device,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # 确保device是一个正确的torch.device对象
+        if isinstance(device, str):
+            device = torch.device(device)
+        
         if self.tokenized_text is None:
             tokenized_text = tokenizer(
                 self.text,
@@ -102,9 +114,11 @@ class InputSegment:
                 add_special_tokens=False,
             )[
                 "input_ids"
-            ].int()  # [1, seqlen]
+            ].int().to(device)  # [1, seqlen]
         else:
             tokenized_text = self.tokenized_text.unsqueeze(0)
+            if tokenized_text.device != device:
+                tokenized_text = tokenized_text.to(device)
 
         if self.audio is None:  # Pure text block
             # Add group_size - 1 tokens between every two text tokens
@@ -113,7 +127,7 @@ class InputSegment:
                     tokenized_text, group_size - 1, value=-100
                 )
             audio_part_input_id = torch.full(
-                (3, tokenized_text.shape[1]), self.zeroemb_idx, dtype=torch.int
+                (3, tokenized_text.shape[1]), self.zeroemb_idx, dtype=torch.int, device=device
             )
         else:  # Audio + text block
             sosp_token = (
@@ -127,6 +141,9 @@ class InputSegment:
                 else None
             )
             audio_part = self.audio.reshape(-1, 3).T  # [3, seqlen]
+            if audio_part.device != device:
+                audio_part = audio_part.to(device)
+                
             assert (
                 audio_part.shape[1] % group_size == 0
             ), f"Audio shape {audio_part.shape} is not divisible by group_size {group_size}"
@@ -148,9 +165,9 @@ class InputSegment:
             tokenized_text = (
                 torch.cat(
                     [
-                        torch.tensor([[sosp_token]], dtype=torch.int),
+                        torch.tensor([[sosp_token]], dtype=torch.int, device=device),
                         tokenized_text,
-                        torch.tensor([[eosp_token]], dtype=torch.int),
+                        torch.tensor([[eosp_token]], dtype=torch.int, device=device),
                     ],
                     dim=1,
                 )
@@ -163,9 +180,9 @@ class InputSegment:
             audio_part_input_id = (
                 torch.cat(
                     [
-                        torch.full((3, group_size), self.zeroemb_idx, dtype=torch.int),
+                        torch.full((3, group_size), self.zeroemb_idx, dtype=torch.int, device=device),
                         audio_part,
-                        torch.full((3, group_size), self.zeroemb_idx, dtype=torch.int),
+                        torch.full((3, group_size), self.zeroemb_idx, dtype=torch.int, device=device),
                     ],
                     dim=1,
                 )
@@ -176,8 +193,17 @@ class InputSegment:
         input_ids = torch.cat(
             [tokenized_text, audio_part_input_id], dim=0
         )  # [4, seqlen]
-
+        
+        # 最后再次确保所有数据在正确设备上
+        if input_ids.device != device:
+            input_ids = input_ids.to(device)
+            
         return input_ids
+
+
+# 工具函数：获取张量的设备与类型
+def get_tensor_info(tensor):
+    return f"Type: {tensor.dtype}, Device: {tensor.device}, Shape: {tensor.shape}"
 
 
 class Inference:
@@ -185,8 +211,15 @@ class Inference:
         self, path, args, model_args, codec_ckpt_path, codec_config_path
     ) -> None:
         self.args = args
-        self.device = DEVICE
         self.group_size = 3
+        
+        # 检测可用的GPU数量
+        self.num_gpus = torch.cuda.device_count()
+        print(f"检测到 {self.num_gpus} 个可用GPU")
+        
+        # 设置主设备为第一个GPU
+        self.main_device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        print(f"主设备: {self.main_device}")
 
         self.tokenizer = AutoTokenizer.from_pretrained(path)
         padding_idx = self.tokenizer.pad_token_id
@@ -196,6 +229,17 @@ class Inference:
         self.empty_token = self.tokenizer.convert_tokens_to_ids("<|empty|>")
         self.end_empty_token = self.tokenizer.convert_tokens_to_ids("<|end_empty|>")
 
+        # 为多GPU设置device_map
+        if self.num_gpus > 1:
+            # 自动平衡各GPU负载
+            device_map = "auto"
+            print("使用自动设备映射分布模型到多个GPU")
+        else:
+            # 单GPU情况
+            device_map = {"": 0}
+            print("仅使用单个GPU")
+            
+        # 加载模型时使用device_map
         self.model = MIMOLlamaForCausalLM.from_pretrained(
             path,
             padding_idx=padding_idx,
@@ -204,8 +248,16 @@ class Inference:
             args=model_args,
             attn_implementation="flash_attention_2",
             torch_dtype=torch.bfloat16,
-            device_map=self.device,
+            device_map=device_map,
+            low_cpu_mem_usage=True,
         )
+        
+        # 打印模型各部分的设备分布情况
+        if hasattr(self.model, 'hf_device_map'):
+            print("模型设备映射:")
+            for module_name, device_id in self.model.hf_device_map.items():
+                print(f"  - {module_name}: {device_id}")
+        
         self.model.eval()
         self.model = torch.compile(self.model, mode="reduce-overhead")
 
@@ -222,20 +274,26 @@ class Inference:
             ),
         }
 
+        # 音频解码器放在主设备上
         self.generator = SpeechGPT2Tokenizer.load_from_checkpoint(
             config_path=codec_config_path, checkpoint_path=codec_ckpt_path
         )
-        self.generator = self.generator.to(self.device)
+        self.generator = self.generator.to(self.main_device)
+        # 确保所有参数都在同一设备上
+        for param in self.generator.parameters():
+            if param.device != self.main_device:
+                param.data = param.data.to(self.main_device)
         self.generator.eval()
         self.generator = torch.compile(self.generator, mode="reduce-overhead")
 
         self.history = []
-
         self.greeting = None
+        
+        print(f"Inference引擎初始化完成，主设备: {self.main_device}")
 
     def set_greeting(self, text, audio):
-        text = torch.tensor(text)
-        audio = torch.tensor(audio).reshape(3, -1)
+        text = torch.tensor(text).to(self.main_device)
+        audio = torch.tensor(audio).reshape(3, -1).to(self.main_device)
         self.greeting = [
             InputSegment(f"[|SpeechGPT|]: "),
             InputSegment(
@@ -250,7 +308,7 @@ class Inference:
             .unsqueeze(0)
             .permute(2, 0, 1)
             .type(torch.LongTensor)
-            .to(self.device)
+            .to(self.main_device)
         )
         return (
             24000,
@@ -284,7 +342,7 @@ class Inference:
             wav = (
                 self.read_wav(input, self.generator.sampling_rate)
                 .reshape(1, 1, -1)
-                .to(self.device)
+                .to(self.main_device)
             )
 
             tokens = self.generator.inference_tokenize(wav)  # [n_vq, B, t]
@@ -292,24 +350,24 @@ class Inference:
                 tokens.squeeze(1).permute(1, 0).reshape(-1).detach().cpu().numpy()
             )  # [T*n_q]
 
-            silence_tokens = torch.tensor([688, 131, 226])
+            silence_tokens = torch.tensor([688, 131, 226], device=self.main_device)
             token_flat = np.concatenate(
-                [token_flat, np.tile(silence_tokens, silence_frames)]
+                [token_flat, np.tile(silence_tokens.cpu().numpy(), silence_frames)]
             )
             token_flat = np.concatenate(
                 [
                     token_flat,
                     np.tile(
-                        silence_tokens,
+                        silence_tokens.cpu().numpy(),
                         (
                             group_size * audio_channels
                             - token_flat.shape[0] % (group_size * audio_channels)
                         )
-                        // len(silence_tokens),
+                        // len(silence_tokens.cpu().numpy()),
                     ),
                 ]
             )
-            audio_tokenized = torch.tensor(token_flat)
+            audio_tokenized = torch.tensor(token_flat, device=self.main_device)
         else:
             text = input
 
@@ -335,10 +393,11 @@ class Inference:
             InputSegment(f" ###\n[|SpeechGPT|]: "),
         ]
 
-        input_ids = [seg.to_input_id(self.tokenizer, group_size) for seg in prompt]
+        # 确保张量都在主设备上
+        input_ids = [seg.to_input_id(self.tokenizer, group_size, self.main_device) for seg in prompt]
         input_ids = torch.cat(input_ids, dim=1)
-
-        return input_ids.to(self.device)
+        
+        return input_ids
 
     def forward(
         self,
@@ -363,8 +422,17 @@ class Inference:
 
             generation_config = GenerationConfig(**self.generate_kwargs)
 
+            # 将输入重新整形
             input_ids = input_ids.T.reshape(1, -1)
-            input_ids = torch.cat(self.history + [input_ids], dim=-1)
+            
+            # 如果有历史记录，连接历史和当前输入
+            if self.history:
+                # 确保历史和当前输入在同一设备上
+                history_device = self.history[0].device
+                if input_ids.device != history_device:
+                    input_ids = input_ids.to(history_device)
+                input_ids = torch.cat(self.history + [input_ids], dim=-1)
+            
             prompt_length = input_ids.shape[1] // (audio_channels + 1)
             stopping_criteria = [
                 MIMOStopper(
@@ -375,14 +443,23 @@ class Inference:
                 )
             ]
 
+            # 检查输入设备与模型设备是否匹配
+            if hasattr(self.model, 'device_map'):
+                first_param_device = next(self.model.parameters()).device
+                if input_ids.device != first_param_device:
+                    input_ids = input_ids.to(first_param_device)
+
+            # 执行推理
             generated_ids = self.model.generate(
                 input_ids,
                 generation_config,
                 stopping_criteria=stopping_criteria,
             )
-            # self.history.append(generated_ids)
+            
+            # 更新历史记录
             self.history = [generated_ids]
 
+            # 将生成的ID移到CPU处理
             generated_ids = (
                 generated_ids.int().cpu().reshape(-1, 4).T[:, prompt_length:]
             )
@@ -421,12 +498,13 @@ class Inference:
                 tokens = torch.tensor(
                     [int(num) for num in re.findall(r"(\d+)>", answer["speech"])]
                 )
+                # 确保音频生成在主设备上进行
                 x = (
                     tokens.reshape(-1, 3)
                     .unsqueeze(0)
                     .permute(2, 0, 1)
                     .type(torch.LongTensor)
-                    .to(self.device)
+                    .to(self.main_device)
                 )  # [n_vq, B, t]
                 wav = self.generator.inference_detokenize(x)
                 return detokenized_text, (24000, wav.reshape(-1).detach().cpu().numpy())
@@ -448,6 +526,11 @@ def parse_args():
     parser.add_argument(
         "--codec_config_path", type=str, default="Codec/config/sg2_codec_config.yaml"
     )
+    parser.add_argument(
+        "--single_gpu",
+        action="store_true",
+        help="强制仅使用单个GPU，不进行多GPU分布",
+    )
     args = parser.parse_args()
     return args
 
@@ -460,6 +543,11 @@ class MIMOInterface:
             return_remaining_strings=True
         )
         self.model_args.model_name_or_path = self.args.model_path
+
+        # 如果指定单GPU模式，设置环境变量
+        if self.args.single_gpu:
+            os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+            print("已启用单GPU模式，仅使用第一个GPU")
 
         self.inference = Inference(
             self.args.model_path,
@@ -485,7 +573,10 @@ class MIMOInterface:
             )
 
         except Exception as e:
-            return f"Error: {str(e)}", None, None
+            import traceback
+            error_trace = traceback.format_exc()
+            print(f"错误详情: {error_trace}")
+            return f"Error: {str(e)}", None
 
     def process_greeting(self, greeting_source, greeting_line_idx):
         greeting_line_idx = int(greeting_line_idx)
@@ -569,6 +660,10 @@ class MIMOInterface:
 
 
 if __name__ == "__main__":
+    print(f"可用GPU数量: {torch.cuda.device_count()}")
+    print(f"CUDA是否可用: {torch.cuda.is_available()}")
+    print(f"当前使用的CUDA设备: {torch.cuda.current_device()}")
+    
     interface = MIMOInterface()
     demo = interface.create_interface()
     demo.launch()
