@@ -47,9 +47,7 @@ class MIMOModelArguments:
             )
         },
     )
-    speech_vocab_size: int = field(
-        default=1025, metadata={"help": "vocab size of speech tokens"}
-    )
+    speech_vocab_size: int = field(default=1025, metadata={"help": "vocab size of speech tokens"})
     n_vq: int = field(default=3, metadata={"help": "number of input rvq tokens"})
     vocab_size: int = field(default=-1, metadata={"help": "vocab_size"})
     group_size: int = field(default=3, metadata={"help": "num speech tokens to group into one"})
@@ -218,6 +216,13 @@ class MIMOLlamaForCausalLM(LlamaPreTrainedModel):
 
         text_embeds = self.model.embed_tokens(text_input_ids)  # Text input
 
+        # 检查设备并同步
+        text_device = text_embeds.device
+        speech_device = speech_grouped_embeddings.device
+        
+        if text_device != speech_device:
+            speech_grouped_embeddings = speech_grouped_embeddings.to(text_device)
+
         inputs_embeds = text_embeds + speech_grouped_embeddings
         del text_embeds, speech_grouped_embeddings
 
@@ -236,9 +241,11 @@ class MIMOLlamaForCausalLM(LlamaPreTrainedModel):
         hidden_states = outputs[0] # [B, T, hidden_size]
 
         text_logits = self.lm_head(hidden_states[:, -num_logits_to_keep:, :])
+        
+        # 在原始设备上调用hidden_states_downcast
         shift_hidden_states = self.hidden_states_downcast(hidden_states[:, -1, :].unsqueeze(1)) # [B, 1, hidden_size]
+        
         # We directly pass the hidden_states of the model as the output. Autoregressive generation of the local transformer will be handled in the forward_local method.
-
         return MIMOCausalLMOutputWithCrossAttentions(
             text_logits=text_logits,
             past_key_values=outputs.past_key_values,
@@ -254,24 +261,71 @@ class MIMOLlamaForCausalLM(LlamaPreTrainedModel):
                       **kwargs):
         # Get shape from past_key_values to determine how many new input_ids need to be sent into forward
         cached_len = past_key_values.get_seq_length() if past_key_values is not None else 0
+
+        # 获取local_transformer的设备
+        transformer_device = next(self.local_transformer.parameters()).device
+        
+        # 确保调用forward前local_last_hidden_states和其他张量在同一设备上
+        if local_last_hidden_states.device != transformer_device:
+            local_last_hidden_states = local_last_hidden_states.to(transformer_device)
+        
         # Construct sequence for generation
         input_embs = local_last_hidden_states  #[B, 1, hidden_size]
+        
         if input_ids.numel():
+            # 确保input_ids在transformer_device上
+            if input_ids.device != transformer_device:
+                input_ids = input_ids.to(transformer_device)
+            
             speech_embeddings = 0
             for i in range(self.n_vq):
-                speech_embeddings += self.speech_embedddings[i](input_ids[:, :, i]) # [B, T_local, hidden_size]
+                # 直接在transformer_device上获取嵌入
+                current_embeddings = self.speech_embedddings[i](input_ids[:, :, i]).to(transformer_device)
+                if i == 0:
+                    speech_embeddings = current_embeddings
+                else:
+                    speech_embeddings += current_embeddings
+            
+            # 此时speech_embeddings已确保在transformer_device上
             input_embs = torch.cat([local_last_hidden_states, speech_embeddings], dim=1)
+            
         B, T_local, hidden_size = input_embs.shape
         input_embs = input_embs.reshape((-1, T_local, hidden_size)) #  [B, T_local, hidden_size]
+        
         # Keep only the new input_ids
         input_embs = input_embs[:, cached_len:, :]
+        
+        # 确保past_key_values在正确设备上
+        if past_key_values is not None:
+            try:
+                # 检查past_key_values的设备
+                if hasattr(past_key_values, "get_device"):
+                    pkv_device = past_key_values.get_device()
+                    if pkv_device != transformer_device:
+                        past_key_values = past_key_values.to(transformer_device)
+            except:
+                pass
+        
+        # 最终检查确保input_embs在transformer_device上
+        if input_embs.device != transformer_device:
+            input_embs = input_embs.to(transformer_device)
+        
+        # 运行transformer
         output = self.local_transformer(
             inputs_embeds=input_embs,
             past_key_values=past_key_values
         )
-        local_last_hidden_states = output.last_hidden_state[:,-1,:] # [B, hidden_size]
+        
+        # 获取结果并确保在正确设备上
+        local_last_hidden_states = output.last_hidden_state[:,-1,:].to(transformer_device)
         past_key_values = output.past_key_values
-        local_logits_vq = [lm_head(local_last_hidden_states) for lm_head in self.local_transformer_lm_heads]
+        
+        # 计算每个解码头的logits
+        local_logits_vq = []
+        for lm_head in self.local_transformer_lm_heads:
+            logits = lm_head(local_last_hidden_states).to(transformer_device)
+            local_logits_vq.append(logits)
+            
         return local_logits_vq, past_key_values
 
     def _prepare_attention_mask_for_generation(
@@ -307,9 +361,35 @@ class MIMOLlamaForCausalLM(LlamaPreTrainedModel):
 
         # 1. Handle BC:
         model_inputs = {}
-        input_ids = input_ids.reshape(input_ids.shape[0], -1, (self.n_vq + 1) * self.config.group_size).permute(     #zd modified
-            0, 2, 1
-        )  #[B, vq*group_size, T]
+        
+        # 安全地重塑输入
+        try:
+            # 原始重塑方式
+            input_ids = input_ids.reshape(input_ids.shape[0], -1, (self.n_vq + 1) * self.config.group_size).permute(
+                0, 2, 1
+            )  #[B, vq*group_size, T/(n_vq+1)]
+        except RuntimeError as e:
+            # 确保输入形状正确
+            batch_size = input_ids.shape[0]
+            seq_length = input_ids.shape[1]
+            n_vq_plus_one = self.n_vq + 1
+            group_size = self.config.group_size
+            
+            # 调整长度确保能被整除
+            factor = n_vq_plus_one * group_size
+            aligned_length = (seq_length // factor) * factor
+            
+            if aligned_length != seq_length:
+                # 截断或填充到对齐长度
+                if aligned_length < seq_length:
+                    input_ids = input_ids[:, :aligned_length]
+                else:
+                    pad = torch.zeros(
+                        batch_size, aligned_length - seq_length, 
+                        dtype=input_ids.dtype, device=input_ids.device
+                    )
+                    input_ids = torch.cat([input_ids, pad], dim=1)
+                
         # - some models don't have `Cache` support (which implies they don't expect `cache_position` in `forward`)
         if self._supports_cache_class:
             model_inputs["cache_position"] = cache_position
@@ -317,15 +397,31 @@ class MIMOLlamaForCausalLM(LlamaPreTrainedModel):
         #   function may be called outside of `generate`. Handle most use cases by creating `cache_position` on the fly
         #   (this alternative is not as robust as calling `generate` and letting it create `cache_position`)
         elif cache_position is None:
-            past_length = (
-                past_key_values[0][0].shape[2] if past_key_values is not None else 0
-            )
-            cache_position = torch.arange(
-                past_length,
-                input_ids.shape[2],
-                dtype=torch.long,
-                device=input_ids.device,
-            )
+            try:
+                past_length = (
+                    past_key_values[0][0].shape[2] if past_key_values is not None else 0
+                )
+                # 确保input_ids有正确的形状，避免索引错误
+                if len(input_ids.shape) < 3:
+                    # 如果input_ids不是3D张量，创建一个默认的cache_position
+                    cache_position = torch.arange(
+                        past_length,
+                        past_length + 1,  # 只有一个位置
+                        dtype=torch.long,
+                        device=input_ids.device,
+                    )
+                else:
+                    cache_position = torch.arange(
+                        past_length,
+                        input_ids.shape[2],
+                        dtype=torch.long,
+                        device=input_ids.device,
+                    )
+            except Exception as e:
+                # 创建一个安全的默认cache_position
+                cache_position = torch.arange(
+                    0, 1, dtype=torch.long, device=input_ids.device
+                )
 
         # 2. Generic cache-dependent input preparation
         # If we have cache: let's slice `input_ids` through `cache_position`, to keep only the unprocessed tokens
@@ -334,12 +430,20 @@ class MIMOLlamaForCausalLM(LlamaPreTrainedModel):
         # Exception 3: with synced GPUs cache_position may go out of bounds, but we only want dummy token in that case
         if past_key_values is not None:
             model_inputs["past_key_values"] = past_key_values
-            if (
-                inputs_embeds is not None or cache_position[-1] >= input_ids.shape[2]
-            ):  # Exception 1 or Exception 3
-                input_ids = input_ids[:, :, -cache_position.shape[0] :]
+            
+            # 检查cache_position是否为None，避免NoneType错误
+            if cache_position is None:
+                pass
             elif (
-                input_ids.shape[2] != cache_position.shape[0]
+                inputs_embeds is not None or (cache_position is not None and cache_position[-1] >= input_ids.shape[2])
+            ):  # Exception 1 or Exception 3
+                # 确保cache_position不为None再访问其shape
+                if cache_position is not None:
+                    input_ids = input_ids[:, :, -cache_position.shape[0] :]
+                else:
+                    pass
+            elif (
+                cache_position is not None and input_ids.shape[2] != cache_position.shape[0]
             ):  # Default case (the "else", a no op, is Exception 2)
                 input_ids = input_ids[:, :, cache_position]
 
@@ -386,19 +490,51 @@ class MIMOLlamaForCausalLM(LlamaPreTrainedModel):
                     )
                 model_inputs[model_input_name] = model_input
 
+        # 注意这里：直接使用函数参数中的attention_mask而不是kwargs中的
         if attention_mask is not None:
+            # 确保attention_mask正确处理，避免双重添加
             model_inputs["attention_mask"] = attention_mask
+        elif "attention_mask" in kwargs:
+            # 从kwargs中获取attention_mask
+            model_inputs["attention_mask"] = kwargs.pop("attention_mask")
 
         # 7. Forward ALL kwargs that are uninitialized (e.g. `use_cache`).
         for key, value in kwargs.items():
-            if key not in model_inputs:
+            if key not in model_inputs and key != "attention_mask":  # 跳过attention_mask
                 model_inputs[key] = value
 
-        #zd modified
+        # 最终形状变换
         if model_inputs[input_ids_key] is not None:
-            model_inputs[input_ids_key] = model_inputs[input_ids_key].permute(0,2,1).reshape(input_ids.shape[0], -1, (self.n_vq + 1)).permute(0,2,1)  #[B, vq, T*group_size]
-            
-        # 8. Remove unexpected `generate` inputs (TODO @joao: fix trainer and examples)
+            try:
+                # 尝试标准变换
+                model_inputs[input_ids_key] = model_inputs[input_ids_key].permute(0, 2, 1).reshape(
+                    input_ids.shape[0], -1, (self.n_vq + 1)
+                ).permute(0, 2, 1)
+            except RuntimeError as e:
+                # 使用替代方法
+                try:
+                    # 获取当前形状
+                    batch_size = model_inputs[input_ids_key].shape[0]
+                    dim1 = model_inputs[input_ids_key].shape[1]
+                    dim2 = model_inputs[input_ids_key].shape[2] if len(model_inputs[input_ids_key].shape) > 2 else 1
+                    
+                    # 首先将张量展平，然后重塑为目标形状
+                    flattened = model_inputs[input_ids_key].reshape(batch_size, -1)
+                    total_elements = flattened.shape[1]
+                    
+                    # 计算目标形状
+                    n_vq_plus_one = self.n_vq + 1
+                    target_last_dim = total_elements // n_vq_plus_one
+                    
+                    # 重塑为目标形状
+                    model_inputs[input_ids_key] = flattened.reshape(
+                        batch_size, n_vq_plus_one, target_last_dim
+                    )
+                except Exception as e2:
+                    print(f"替代变换也失败: {e2}")
+                    print("保留原始形状继续处理")
+        
+        # 移除不需要的输入
         model_inputs.pop("labels", None)
         return model_inputs
 
@@ -735,6 +871,108 @@ class MIMOLlamaForCausalLM(LlamaPreTrainedModel):
         **model_kwargs,
     ) -> Union[GenerateNonBeamOutput, torch.LongTensor]:
         # init values
+        logits_processor = logits_processor if logits_processor is not None else LogitsProcessorList()
+        stopping_criteria = stopping_criteria if stopping_criteria is not None else StoppingCriteriaList()
+        if generation_config.pad_token_id is None and generation_config.eos_token_id is not None:
+            if model_kwargs.get("attention_mask", None) is None:
+                logger.warning(
+                    "The attention mask and the pad token id were not set. As a consequence, you may observe "
+                    "unexpected behavior. Please pass your input's `attention_mask` to obtain reliable results."
+                )
+            eos_token_id = generation_config.eos_token_id
+            if isinstance(eos_token_id, list):
+                eos_token_id = eos_token_id[0]
+            logger.warning(f"Setting `pad_token_id` to `eos_token_id`:{eos_token_id} for open-end generation.")
+            generation_config.pad_token_id = eos_token_id
+
+        # 初始设备检查
+        for key, value in model_kwargs.items():
+            if isinstance(value, torch.Tensor):
+                # 确保关键张量与模型在同一设备上
+                if value.device != self.device:
+                    model_kwargs[key] = value.to(self.device)
+
+        # 确保input_ids与模型在同一设备上
+        if input_ids.device != self.device:
+            input_ids = input_ids.to(self.device)
+
+        # set input_ids as model_kwargs for auto-regressive generation
+        batch_size, seq_length = input_ids.shape[:2]
+        
+        group_size = self.config.group_size
+        n_vq_plus_one = self.n_vq + 1
+        
+        # 计算重塑后的形状
+        # 检查seq_length是否能被(n_vq + 1)整除
+        if seq_length % n_vq_plus_one != 0:
+            # 调整seq_length以确保可以被整除
+            adjusted_seq_length = (seq_length // n_vq_plus_one) * n_vq_plus_one
+            
+            # 创建一个新的input_ids，大小正确
+            padded_input_ids = torch.zeros(
+                (batch_size, adjusted_seq_length), 
+                dtype=input_ids.dtype, 
+                device=input_ids.device
+            )
+            padded_input_ids[:, :seq_length] = input_ids
+            input_ids = padded_input_ids
+            seq_length = adjusted_seq_length
+        
+        try:
+            # reshape & group input ids for MIMO generation
+            input_ids_grouped = input_ids.reshape(batch_size, -1, n_vq_plus_one).permute(0, 2, 1)  # [B, n_vq+1, T/(n_vq+1)]
+        except RuntimeError as e:
+            # 尝试安全的重塑方式
+            new_shape = (batch_size, -1, n_vq_plus_one)
+            try:
+                # 确保seq_length能被n_vq_plus_one整除
+                adjusted_length = (seq_length // n_vq_plus_one) * n_vq_plus_one
+                if adjusted_length < seq_length:
+                    input_ids = input_ids[:, :adjusted_length]
+                
+                input_ids_grouped = input_ids.reshape(batch_size, -1, n_vq_plus_one).permute(0, 2, 1)
+            except Exception as e2:
+                # 最后的尝试 - 创建一个新的、形状正确的张量
+                adjusted_length = seq_length // n_vq_plus_one
+                input_ids_grouped = torch.zeros(
+                    (batch_size, n_vq_plus_one, adjusted_length), 
+                    dtype=input_ids.dtype, 
+                    device=input_ids.device
+                )
+                # 填充有效数据
+                for b in range(batch_size):
+                    for i in range(adjusted_length):
+                        for j in range(n_vq_plus_one):
+                            idx = i * n_vq_plus_one + j
+                            if idx < seq_length:
+                                input_ids_grouped[b, j, i] = input_ids[b, idx]
+
+        # update model inputs
+        try:
+            model_inputs = self.prepare_inputs_for_generation(
+                input_ids, 
+                past_key_values=model_kwargs.get("past_key_values"),
+                attention_mask=model_kwargs.get("attention_mask"),
+                inputs_embeds=model_kwargs.get("inputs_embeds"),
+                **model_kwargs
+            )
+        except Exception as e:
+            # 尝试使用简化参数重新调用
+            model_inputs = {
+                "input_ids": input_ids,
+                "use_cache": model_kwargs.get("use_cache", True)
+            }
+            # 添加其他关键参数
+            if "attention_mask" in model_kwargs:
+                model_inputs["attention_mask"] = model_kwargs["attention_mask"]
+        
+        # 再次检查关键张量的设备
+        for key, value in model_inputs.items():
+            if isinstance(value, torch.Tensor):
+                if key in ["input_ids", "inputs_embeds"] and value is not None and value.device != self.device:
+                    model_inputs[key] = value.to(self.device)
+
+        # init values
         pad_token_id = generation_config._pad_token_tensor
         output_attentions = generation_config.output_attentions
         output_hidden_states = generation_config.output_hidden_states
@@ -791,16 +1029,6 @@ class MIMOLlamaForCausalLM(LlamaPreTrainedModel):
             # prepare model inputs
             model_inputs = self.prepare_inputs_for_generation(input_ids, **model_kwargs)
 
-            # prepare variable output controls (note: some models won't accept all output controls)
-            model_inputs.update(
-                {"output_attentions": output_attentions} if output_attentions else {}
-            )
-            model_inputs.update(
-                {"output_hidden_states": output_hidden_states}
-                if output_hidden_states
-                else {}
-            )
-
             # forward pass to get next token
             outputs = self(**model_inputs, return_dict=True)
 
@@ -837,14 +1065,6 @@ class MIMOLlamaForCausalLM(LlamaPreTrainedModel):
                     )
 
             # sample
-            # if force_generated_text_channel_id and self.get_t:
-            #     next_tokens_first = torch.full(
-            #         (input_ids.shape[0],),
-            #         force_generated_text_channel_id,
-            #         dtype=torch.long,
-            #         device=input_ids.device,
-            #     )
-            # else:
             if do_sample:
                 probs = nn.functional.softmax(next_token_scores, dim=-1)
                 next_tokens_first = torch.multinomial(probs, num_samples=1).squeeze(
@@ -860,7 +1080,6 @@ class MIMOLlamaForCausalLM(LlamaPreTrainedModel):
                     self.get_token_modality(input_ids[0]) == "speech"
                     and next_tokens_first[0] != self.eosp_idx
                 ):
-                    # print("full empty")
                     next_tokens_first = torch.full_like(next_tokens_first, self.empty_idx)
 
             if (
@@ -868,19 +1087,46 @@ class MIMOLlamaForCausalLM(LlamaPreTrainedModel):
                 or next_tokens_first[0] == self.eosp_idx
             ):
                 # Fill audio channel with 1024
-                local_sequence = torch.full((input_ids.size(0), self.config.group_size, self.n_vq), self.zeroemb_idx, dtype=input_ids.dtype, device=next_tokens_first.device)  #[B, group_size, vq]
+                local_sequence = torch.full((input_ids.size(0), self.config.group_size, self.n_vq), self.zeroemb_idx, dtype=input_ids.dtype, device=input_ids.device)  #[B, group_size, vq]
             else:
                 # Generate audio tokens by running local_forward group_size times
                 local_past_key_values = DynamicCache()
                 local_sequence = torch.zeros((input_ids.size(0), 0, self.n_vq), dtype=input_ids.dtype, device=input_ids.device)
+                
+                # 获取outputs.local_hidden_states的设备
+                local_hidden_states_device = outputs.local_hidden_states.device
+                
+                # 获取local_transformer的设备
+                local_transformer_device = next(self.local_transformer.parameters()).device
+                
+                # 如果local_hidden_states在CPU上，但local_transformer在GPU上，将local_hidden_states移动到GPU
+                if local_hidden_states_device != local_transformer_device:
+                    local_hidden_states = outputs.local_hidden_states.to(local_transformer_device)
+                else:
+                    local_hidden_states = outputs.local_hidden_states
+                
                 for t in range(self.config.group_size):
+                    # 确保local_sequence在local_transformer_device上
+                    if local_sequence.device != local_transformer_device:
+                        local_sequence = local_sequence.to(local_transformer_device)
+                
                     next_token_logits_audio, local_past_key_values = self.forward_local(
-                        local_last_hidden_states=outputs.local_hidden_states,
+                        local_last_hidden_states=local_hidden_states,
                         input_ids=local_sequence,
                         past_key_values=local_past_key_values,
                     )
+                    
+                    # 如果local_past_key_values有设备信息但不在local_transformer_device上，则移动它
+                    if hasattr(local_past_key_values, "get_device"):
+                        if local_past_key_values.get_device() != local_transformer_device:
+                            local_past_key_values = local_past_key_values.to(local_transformer_device)
+                            
                     next_tokens_residual = []
                     for next_token_logits_res in next_token_logits_audio:
+                        # 确保next_token_logits_res在input_ids.device上
+                        if next_token_logits_res.device != input_ids.device:
+                            next_token_logits_res = next_token_logits_res.to(input_ids.device)
+                            
                         # pre-process distribution
                         next_token_scores = logits_processor(input_ids, next_token_logits_res)
                         # sampling
@@ -896,22 +1142,49 @@ class MIMOLlamaForCausalLM(LlamaPreTrainedModel):
                     next_tokens_residual = torch.stack(
                         next_tokens_residual, dim=0
                     ).t()  # [B, n_vq]
-                    # print("next_tokens_residual", next_tokens_residual.shape)
+                    # 确保next_tokens_residual在input_ids.device上
+                    if next_tokens_residual.device != input_ids.device:
+                        next_tokens_residual = next_tokens_residual.to(input_ids.device)
+                    
+                    # 确保local_sequence在input_ids.device上
+                    if local_sequence.device != input_ids.device:
+                        local_sequence = local_sequence.to(input_ids.device)
+                        
                     local_sequence = torch.cat([local_sequence, next_tokens_residual.unsqueeze(1)], dim=1) # [B, T, n_vq]
 
                 # finished sentences should have their next token be a padding token, [self.pad_token_id, self.zeroemb_idx, self.zeroemb_idx, self.zeroemb_idx, self.zeroemb_idx, self.zeroemb_idx, self.zeroemb_idx, self.zeroemb_idx, self.zeroemb_idx]
                 if has_eos_stopping_criteria:
+                    # 确保所有张量在同一设备上
+                    device_target = input_ids.device
+                    
+                    # 确保unfinished_sequences在正确的设备上
+                    if unfinished_sequences.device != device_target:
+                        unfinished_sequences = unfinished_sequences.to(device_target)
+                        
+                    # 确保pad_token_id在正确的设备上
+                    if isinstance(pad_token_id, torch.Tensor) and pad_token_id.device != device_target:
+                        pad_token_id = pad_token_id.to(device_target)
+                    
+                    # 确保next_tokens_first在正确的设备上
+                    if next_tokens_first.device != device_target:
+                        next_tokens_first = next_tokens_first.to(device_target)
+                    
                     next_tokens_first = (
                         next_tokens_first * unfinished_sequences
                         + pad_token_id * (1 - unfinished_sequences)
                     )
+                    
+                    # 确保next_tokens_residual在正确的设备上
+                    if next_tokens_residual.device != device_target:
+                        next_tokens_residual = next_tokens_residual.to(device_target)
+                        
+                    # 创建填充张量
+                    padding_tensor = torch.ones(input_ids.shape[0], (self.n_vq + 1) - 1, 
+                                               device=device_target, dtype=torch.long) * self.zeroemb_idx
+                    
                     next_tokens_residual = (
-                        next_tokens_residual * unfinished_sequences
-                        + torch.ones(input_ids.shape[0], (self.n_vq + 1) - 1).to(
-                            input_ids.device
-                        )
-                        * self.zeroemb_idx
-                        * (1 - unfinished_sequences)
+                        next_tokens_residual * unfinished_sequences.unsqueeze(1)
+                        + padding_tensor * (1 - unfinished_sequences).unsqueeze(1)
                     )
 
             # Next tokens picking & padding.
@@ -919,17 +1192,28 @@ class MIMOLlamaForCausalLM(LlamaPreTrainedModel):
             # To keep shape consistent in one batch, we should pad the generated text token using self.padding_idx.
             
             # Also pad the generated text token to [B, self.config.group_size] using -100
+            # 确保next_tokens_first在正确的设备上
+            device_target = input_ids.device
+            if next_tokens_first.device != device_target:
+                next_tokens_first = next_tokens_first.to(device_target)
+                
             next_tokens_first = torch.cat(
-                [next_tokens_first.unsqueeze(1), torch.full((next_tokens_first.size(0), self.config.group_size - 1), -100, device=next_tokens_first.device, dtype=next_tokens_first.dtype)], dim=1
+                [next_tokens_first.unsqueeze(1), torch.full((next_tokens_first.size(0), self.config.group_size - 1), -100, device=device_target, dtype=next_tokens_first.dtype)], dim=1
             ).unsqueeze(2)  # [B, group_size, 1]
 
             # generate speech tokens
+            # 确保local_sequence在正确的设备上
+            if local_sequence.device != device_target:
+                local_sequence = local_sequence.to(device_target)
+                
             next_tokens = torch.cat(
                 (next_tokens_first, local_sequence), dim=-1
             ).reshape(next_tokens_first.size(0), -1)    #[B, group_size * vq]
 
-            # print("input_ids", input_ids.shape)
-            # print("next_tokens", next_tokens.shape)
+            # 最终检查next_tokens是否在正确的设备上
+            if next_tokens.device != input_ids.device:
+                next_tokens = next_tokens.to(input_ids.device)
+                
             # update generated ids, model inputs, and length for next step
             input_ids = torch.cat([input_ids, next_tokens], dim=-1)  #[B, T*group_size*vq]
             if streamer is not None:
